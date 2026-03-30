@@ -17,11 +17,8 @@ import kotlinx.serialization.modules.SerializersModule
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
 import kotlin.reflect.typeOf
-import kotlin.time.Duration
 import kotlin.time.ExperimentalTime
-import kotlin.time.Instant
 import kotlin.uuid.ExperimentalUuidApi
-import kotlin.uuid.Uuid
 
 /**
  * Context interface for creating schema from type metadata.
@@ -77,11 +74,13 @@ public class KotlinxSerializerJsonSchemaInference(
         /**
          * Default instance of KotlinxSerializerJsonSchemaInference using an empty serializers module.
          */
-        public val Default: KotlinxSerializerJsonSchemaInference =
+        public val Default: KotlinxSerializerJsonSchemaInference get() =
             KotlinxSerializerJsonSchemaInference(EmptySerializersModule())
     }
+    private val kTypeLookup = mutableMapOf<String, KType>()
 
     override fun buildSchema(type: KType): JsonSchema {
+        includeKType(type)
         return buildSchemaFromDescriptor(
             module.serializer(type).descriptor,
             // parameterized types cannot be referenced from their serial name
@@ -90,17 +89,33 @@ public class KotlinxSerializerJsonSchemaInference(
         )
     }
 
+    private fun includeKType(type: KType) {
+        // use toString() because qualifiedName is unavailable in web
+        val qualifiedName = type.toString().substringBefore('<')
+        if (qualifiedName in kTypeLookup) return
+        kTypeLookup[qualifiedName] = type
+        for (typeArg in type.arguments) {
+            typeArg.type?.let(::includeKType)
+        }
+    }
+
+    private fun SerialDescriptor.isParameterized(): Boolean =
+        kTypeLookup[nonNullSerialName]?.arguments?.isNotEmpty() == true
+
     @OptIn(ExperimentalSerializationApi::class, InternalAPI::class)
     internal fun buildSchemaFromDescriptor(
         descriptor: SerialDescriptor,
-        includeTitle: Boolean = true,
+        includeTitle: Boolean = !descriptor.isParameterized(),
         includeAnnotations: List<Annotation> = emptyList(),
         visiting: MutableSet<String>,
     ): JsonSchema {
         val reflectJsonSchema: KClass<*>.() -> ReferenceOr<JsonSchema> = {
             Value(
-                module.serializer(this, emptyList(), false)
-                    .descriptor.buildJsonSchema(includeTitle, visiting = visiting)
+                buildSchemaFromDescriptor(
+                    descriptor = module.serializer(this, emptyList(), false).descriptor,
+                    includeTitle = includeTitle,
+                    visiting = visiting,
+                )
             )
         }
         val annotations = includeAnnotations + descriptor.annotations
@@ -108,11 +123,11 @@ public class KotlinxSerializerJsonSchemaInference(
 
         // For inline descriptors, use the delegate descriptor
         if (descriptor.isInline) {
-            return descriptor.getElementDescriptor(0)
-                .buildJsonSchema(
-                    visiting = visiting,
-                    includeAnnotations = includeAnnotations
-                )
+            return buildSchemaFromDescriptor(
+                descriptor = descriptor.getElementDescriptor(0),
+                includeAnnotations = includeAnnotations,
+                visiting = visiting,
+            )
         }
 
         return when (descriptor.kind) {
@@ -146,7 +161,8 @@ public class KotlinxSerializerJsonSchemaInference(
                                 .nonNullable(elementDescriptor.isNullable)
                         } else {
                             Value(
-                                elementDescriptor.buildJsonSchema(
+                                buildSchemaFromDescriptor(
+                                    descriptor = elementDescriptor,
                                     includeAnnotations = descriptor.getElementAnnotations(i),
                                     visiting = visiting,
                                 )
