@@ -5,8 +5,14 @@
 package io.ktor.util.pipeline
 
 import io.ktor.util.*
-import kotlin.coroutines.*
-import kotlin.coroutines.intrinsics.*
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.ContinuationInterceptor
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
+import kotlin.coroutines.intrinsics.intercepted
+import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
+import kotlin.coroutines.resumeWithException
 
 internal class SuspendFunctionGun<TSubject : Any, TContext : Any>(
     initial: TSubject,
@@ -84,7 +90,7 @@ internal class SuspendFunctionGun<TSubject : Any, TContext : Any>(
     override suspend fun proceed(): TSubject = suspendCoroutineUninterceptedOrReturn { continuation ->
         if (index == blocks.size) return@suspendCoroutineUninterceptedOrReturn subject
 
-        addContinuation(continuation.intercepted())
+        addContinuation(continuation)
 
         if (loop(true)) {
             discardLastRootContinuation()
@@ -142,11 +148,19 @@ internal class SuspendFunctionGun<TSubject : Any, TContext : Any>(
         val next = suspensions[lastSuspensionIndex]!!
         suspensions[lastSuspensionIndex--] = null
 
+        // Dispatch only when the continuation's dispatcher requires it (e.g. resuming from a
+        // different thread). When already on the correct thread, resume unintercepted to avoid
+        // a second updateThreadContext call — the incoming dispatch already applied the context.
+        val toResume = when (val interceptor = next.context[ContinuationInterceptor]) {
+            is CoroutineDispatcher -> if (interceptor.isDispatchNeeded(next.context)) next.intercepted() else next
+            else -> next.intercepted()
+        }
+
         if (!result.isFailure) {
-            next.resumeWith(result)
+            toResume.resumeWith(result)
         } else {
             val exception = recoverStackTraceBridge(result.exceptionOrNull()!!, next)
-            next.resumeWithException(exception)
+            toResume.resumeWithException(exception)
         }
     }
 
